@@ -43,6 +43,93 @@ def build_sam_vit_b(checkpoint=None):
         checkpoint=checkpoint,
     )
 
+from typing import Any, Dict, Optional, Tuple
+
+# ---------- 辅助函数 ----------
+def _safe_load_checkpoint(path_or_file: str):
+    """
+    安全加载 checkpoint，兼容多种保存方式并尽量绕过 persistent_id 问题。
+    返回加载得到的原始对象（可能是 state_dict、dict、nn.Module 等）。
+    """
+    last_exc = None
+    # 1) 直接用 torch.load(path)
+    try:
+        return torch.load(path_or_file, map_location=torch.device('cpu'))
+    except Exception as e:
+        last_exc = e
+
+    # 2) try file object with torch.load
+    try:
+        with open(path_or_file, "rb") as f:
+            return torch.load(f, map_location=torch.device("cpu"))
+    except Exception as e:
+        last_exc = e
+
+    # 3) try pickle.load
+    try:
+        with open(path_or_file, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:
+        last_exc = e
+
+    # 4) try Unpickler ignoring persistent_load (best-effort)
+    class _IgnorePersistentUnpickler(pickle.Unpickler):
+        def persistent_load(self, pid):
+            # 忽略 persistent id，返回 None（可能导致部分对象为 None）
+            return None
+
+    try:
+        with open(path_or_file, "rb") as f:
+            return _IgnorePersistentUnpickler(f).load()
+    except Exception:
+        # 抛出最初的异常，便于调试
+        raise last_exc
+
+def _extract_state_dict(obj: Any) -> Optional[Dict[str, Any]]:
+    """
+    尝试从加载对象中提取 state_dict（若可能）。
+    返回 state_dict 或 None（无法提取）。
+    """
+    if obj is None:
+        return None
+
+    # 如果是 nn.Module，直接取 state_dict
+    if isinstance(obj, torch.nn.Module):
+        return obj.state_dict()
+
+    # 如果是 dict：检查常见 key
+    if isinstance(obj, dict):
+        # 常见字段名
+        for k in ('state_dict', 'model', 'model_state_dict', 'net', 'state'):
+            if k in obj and isinstance(obj[k], dict):
+                return obj[k]
+        # 若 dict 的 value 大多为 tensor，则可能已经是 state_dict
+        tensor_like = sum(1 for v in obj.values() if isinstance(v, (torch.Tensor,)))
+        if len(obj) > 0 and tensor_like / len(obj) > 0.5:
+            return obj
+        # 否则无法确定
+        return None
+
+    # 其他情况暂不支持
+    return None
+
+def _strip_module_prefix(state_dict: Dict[str, Any], prefix: str = "module.") -> Dict[str, Any]:
+    """
+    如果大多数 key 带有 prefix，则移除它。
+    """
+    keys = list(state_dict.keys())
+    if not keys:
+        return state_dict
+    with_prefix = sum(1 for k in keys if k.startswith(prefix))
+    if with_prefix / len(keys) > 0.5:
+        new_sd = {}
+        for k, v in state_dict.items():
+            if k.startswith(prefix):
+                new_sd[k[len(prefix):]] = v
+            else:
+                new_sd[k] = v
+        return new_sd
+    return state_dict
 
 def build_sam_vit_t(checkpoint=None):
     prompt_embed_dim = 256
@@ -87,11 +174,48 @@ def build_sam_vit_t(checkpoint=None):
         )
 
     mobile_sam.eval()
+
+    # -------- 如果提供 checkpoint，尝试加载 --------
     if checkpoint is not None:
-        with open(checkpoint, "rb") as f:
-            state_dict = torch.load(f, map_location=torch.device('cpu'), weights_only=False)
-        info = mobile_sam.load_state_dict(state_dict, strict=False)
-        print(info)
+        print(f"[build_sam_vit_t] Loading checkpoint from: {checkpoint}")
+        # 1) 读取对象
+        ckpt_obj = _safe_load_checkpoint(checkpoint)
+
+        # 2) 尝试提取 state_dict
+        state_dict = _extract_state_dict(ckpt_obj)
+        if state_dict is None:
+            # 若无法直接提取，尝试把顶层 dict 作为 state_dict（最后一招）
+            if isinstance(ckpt_obj, dict):
+                state_dict = ckpt_obj
+            else:
+                raise RuntimeError(
+                    f"[build_sam_vit_t] Cannot extract state_dict from checkpoint object of type {type(ckpt_obj)}")
+
+        # 3) 处理 'module.' 前缀
+        state_dict = _strip_module_prefix(state_dict, prefix="module.")
+
+        # 4) 尝试加载到模型
+        try:
+            info = mobile_sam.load_state_dict(state_dict, strict=False)
+            print("[build_sam_vit_t] load_state_dict result:", info)
+        except Exception as e:
+            # 如果直接加载失败，尝试按 key 后缀匹配（最简单的启发式尝试）
+            print(f"[build_sam_vit_t] load_state_dict raised: {e}. Trying heuristic key matching...")
+            model_sd = mobile_sam.state_dict()
+            new_sd = {}
+            ckpt_keys = list(state_dict.keys())
+            for mk in model_sd.keys():
+                # 找第一个以 mk 结尾的 ckpt key
+                candidates = [k for k in ckpt_keys if k.endswith(mk)]
+                if candidates:
+                    new_sd[mk] = state_dict[candidates[0]]
+            info = mobile_sam.load_state_dict(new_sd, strict=False)
+            print("[build_sam_vit_t] heuristic load result:", info)
+    # if checkpoint is not None:
+    #     with open(checkpoint, "rb") as f:
+    #         state_dict = torch.load(f, map_location=torch.device('cpu'), weights_only=False)
+    #     info = mobile_sam.load_state_dict(state_dict, strict=False)
+    #     print(info)
     for n, p in mobile_sam.named_parameters():
         if 'hf_token' not in n and 'hf_mlp' not in n and 'compress_vit_feat' not in n and 'embedding_encoder' not in n and 'embedding_maskfeature' not in n:
             p.requires_grad = False
@@ -155,11 +279,48 @@ def _build_sam(
         pixel_std=[58.395, 57.12, 57.375],
     )
     sam.eval()
+
+    # -------- 如果提供 checkpoint，尝试加载 --------
     if checkpoint is not None:
-        with open(checkpoint, "rb") as f:
-            state_dict = torch.load(f, map_location=torch.device('cpu'), weights_only=False)
-        info = sam.load_state_dict(state_dict, strict=False)
-        print(info)
+        print(f"[build_sam_vit_t] Loading checkpoint from: {checkpoint}")
+        # 1) 读取对象
+        ckpt_obj = _safe_load_checkpoint(checkpoint)
+
+        # 2) 尝试提取 state_dict
+        state_dict = _extract_state_dict(ckpt_obj)
+        if state_dict is None:
+            # 若无法直接提取，尝试把顶层 dict 作为 state_dict（最后一招）
+            if isinstance(ckpt_obj, dict):
+                state_dict = ckpt_obj
+            else:
+                raise RuntimeError(
+                    f"[build_sam_vit_t] Cannot extract state_dict from checkpoint object of type {type(ckpt_obj)}")
+
+        # 3) 处理 'module.' 前缀
+        state_dict = _strip_module_prefix(state_dict, prefix="module.")
+
+        # 4) 尝试加载到模型
+        try:
+            info = sam.load_state_dict(state_dict, strict=False)
+            print("[build_sam_vit_t] load_state_dict result:", info)
+        except Exception as e:
+            # 如果直接加载失败，尝试按 key 后缀匹配（最简单的启发式尝试）
+            print(f"[build_sam_vit_t] load_state_dict raised: {e}. Trying heuristic key matching...")
+            model_sd = sam.state_dict()
+            new_sd = {}
+            ckpt_keys = list(state_dict.keys())
+            for mk in model_sd.keys():
+                # 找第一个以 mk 结尾的 ckpt key
+                candidates = [k for k in ckpt_keys if k.endswith(mk)]
+                if candidates:
+                    new_sd[mk] = state_dict[candidates[0]]
+            info = sam.load_state_dict(new_sd, strict=False)
+            print("[build_sam_vit_t] heuristic load result:", info)
+    # if checkpoint is not None:
+    #     with open(checkpoint, "rb") as f:
+    #         state_dict = torch.load(f, map_location=torch.device('cpu'), weights_only=False)
+    #     info = sam.load_state_dict(state_dict, strict=False)
+    #     print(info)
     for n, p in sam.named_parameters():
         if 'hf_token' not in n and 'hf_mlp' not in n and 'compress_vit_feat' not in n and 'embedding_encoder' not in n and 'embedding_maskfeature' not in n:
             p.requires_grad = False
