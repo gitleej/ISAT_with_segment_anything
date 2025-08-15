@@ -132,10 +132,10 @@ class Sam(nn.Module):
         return outputs
 
     def postprocess_masks(
-        self,
-        masks: torch.Tensor,
-        input_size: Tuple[int, ...],
-        original_size: Tuple[int, ...],
+            self,
+            masks: torch.Tensor,
+            input_size: Tuple[int, ...],
+            original_size: Tuple[int, ...],
     ) -> torch.Tensor:
         """
         Remove padding and upscale masks to the original image size.
@@ -152,15 +152,66 @@ class Sam(nn.Module):
           (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
             is given by original_size.
         """
+        # Save original dtype (for optional restoration)
+        orig_dtype = masks.dtype
+
+        # Interpolate does not support bfloat16 on many builds -> convert to float32 first
+        if masks.dtype == torch.bfloat16:
+            masks = masks.to(torch.float32)
+
+        # first upsample to encoder img_size
         masks = F.interpolate(
             masks,
             (self.image_encoder.img_size, self.image_encoder.img_size),
             mode="bilinear",
             align_corners=False,
         )
+        # remove padding
         masks = masks[..., : input_size[0], : input_size[1]]
+        # upsample to original image size
         masks = F.interpolate(masks, original_size, mode="bilinear", align_corners=False)
+
+        # NOTE: We keep masks as float32 to ensure compatibility with downstream ops such as
+        # thresholding / multiplication / further interpolation. If you *must* restore the
+        # original dtype (e.g. to bfloat16), uncomment the following lines:
+        #
+        # if orig_dtype != torch.float32:
+        #     masks = masks.to(orig_dtype)
+        #
+        # Restoring to bf16 may re-introduce issues for some ops; only restore if you are sure
+        # downstream ops support that dtype.
+
         return masks
+    # def postprocess_masks(
+    #     self,
+    #     masks: torch.Tensor,
+    #     input_size: Tuple[int, ...],
+    #     original_size: Tuple[int, ...],
+    # ) -> torch.Tensor:
+    #     """
+    #     Remove padding and upscale masks to the original image size.
+    #
+    #     Arguments:
+    #       masks (torch.Tensor): Batched masks from the mask_decoder,
+    #         in BxCxHxW format.
+    #       input_size (tuple(int, int)): The size of the image input to the
+    #         model, in (H, W) format. Used to remove padding.
+    #       original_size (tuple(int, int)): The original size of the image
+    #         before resizing for input to the model, in (H, W) format.
+    #
+    #     Returns:
+    #       (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
+    #         is given by original_size.
+    #     """
+    #     masks = F.interpolate(
+    #         masks,
+    #         (self.image_encoder.img_size, self.image_encoder.img_size),
+    #         mode="bilinear",
+    #         align_corners=False,
+    #     )
+    #     masks = masks[..., : input_size[0], : input_size[1]]
+    #     masks = F.interpolate(masks, original_size, mode="bilinear", align_corners=False)
+    #     return masks
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""

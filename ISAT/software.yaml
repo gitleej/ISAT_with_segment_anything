@@ -21,8 +21,6 @@ label:
   name: fence
 - color: '#204a87'
   name: hat
-- color: '#813d9c'
-  name: bed
 shortcut:
   actionAbout:
     default_key: ''
@@ -158,7 +156,7 @@ software:
   contour_mode: external
   create_mode_invisible_polygon: true
   current_converter: coco
-  language: en
+  language: zh
   mask_alpha: 0.6
   real_time_area: false
   show_edge: true

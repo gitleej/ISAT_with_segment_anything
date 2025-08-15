@@ -2,6 +2,8 @@
 # @Author  : LG
 
 from PyQt5 import QtWidgets, QtCore, QtGui
+from mmdeploy.backend.sdk.backend_manager import module_name
+
 from ISAT.ui.MainWindow import Ui_MainWindow
 from ISAT.widgets.category_setting_dialog import CategorySettingDialog
 from ISAT.widgets.category_edit_dialog import CategoryEditDialog
@@ -460,7 +462,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     def init_segment_anything(self, model_path=None, checked=None):
         if checked is not None and not checked:
             return
-        model_name = os.path.basename(model_path)
+        model_name = None
+        if model_path is not None:
+            model_name = os.path.basename(model_path)
 
         if not self.saved:
             result = QtWidgets.QMessageBox.question(self, 'Warning', 'Proceed without saved?', QtWidgets.QMessageBox.StandardButton.Yes|QtWidgets.QMessageBox.StandardButton.No, QtWidgets.QMessageBox.StandardButton.No)
